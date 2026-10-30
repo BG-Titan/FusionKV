@@ -1,0 +1,136 @@
+# FusionKV — Strata-inspired tiered + elastic KV cache for vLLM
+
+External module (pip package + `vllm.general_plugins` plugin + C++ core).
+No vLLM source edits: vLLM adaptation happens through the public
+`KVConnectorBase_V1` connector API, the plugin entry point, and (elastic
+mode only) three small runtime monkey-patches in
+[`fusionkv/patch.py`](fusionkv/patch.py).
+
+Full mechanism analysis (Strata hot/cold window, VMM pool, copy engine,
+coupling with attention backends, and the FusionKV mapping) is in
+[`docs/strata-kv-mechanism.md`](docs/strata-kv-mechanism.md).
+
+## Two features
+
+**A — host tier (always safe, default mode).**
+A pinned host RAM KV tier managed like Strata's: run-coalesced batch
+D2H/H2D through a C++ copy engine, LRU + second-chance host block index,
+async prefix restore via vLLM's `WAITING_FOR_REMOTE_KVS`. Sessions whose
+KV left the GPU still resume with prompt-recompute skipped; GPU VRAM no
+longer bounds how much prefix history survives.
+
+**B — elastic pool (experimental, opt-in).**
+Strata's `VmmRange`: reserve a huge virtual address range with
+`cuMemAddressReserve`, map physical 2 MiB chunks on demand
+(`cuMemMap`). vLLM advertises a KV pool larger than physical VRAM; the
+physical mapping follows a per-step block-id grow-hint shipped in the
+connector metadata and is mapped *before* forward (attention writes KV in
+place). This is the "small VRAM floor" port: the engine boots while
+holding only a slice of the KV pool in DRAM.
+
+## Install
+
+```bash
+pip install ./fusionkv          # compiles csrc/*.cpp -> fusionkv._C (g++ + pybind11)
+```
+
+The native core `dlopen()`s `libcuda` at runtime — no CUDA toolkit needed
+to build. On systems without Python dev headers set `FUSIONKV_PY_INC`;
+`FUSIONKV_SKIP_BUILD=1` installs pure-python (tiering falls back to torch
+gather copies; elastic unavailable).
+
+## Enable (A-tier example)
+
+```bash
+VLLM_PLUGINS=fusionkv python -m vllm.entrypoints.openai.api_server \
+    --model /path/to/model \
+    --kv-transfer-config '{"kv_connector":"FusionKV","kv_role":"kv_both",
+                           "kv_connector_extra_config":
+                           {"cpu_bytes_to_use":"32GiB"}}'
+```
+
+(`VLLM_PLUGINS` is optional — general plugins auto-load unless an
+allowlist is set.) No `--kv-transfer-config`? The plugin still registers
+the connector name, so it can also be selected via `kv_connector_module_path`
+in any existing tooling.
+
+## Config knobs
+
+extra_config key / env var (env wins over missing key, key wins over default):
+
+| key | env | default | meaning |
+|---|---|---|---|
+| `cpu_bytes_to_use` | `FUSIONKV_CPU_BYTES` | 0 (=off) | pinned host arena budget |
+| `cpu_bytes_to_use_per_rank` | `FUSIONKV_CPU_BYTES_PER_RANK` | 0 | skip world-size split |
+| `lazy_store` | `FUSIONKV_LAZY_STORE` | false | stage only under host pressure |
+| `high_water` | `FUSIONKV_HIGH_WATER` | 0.9 | lazy drain threshold |
+| `store_batch_blocks` | `FUSIONKV_STORE_BATCH_BLOCKS` | 512 | blocks per step cap |
+| `offload_after_secs` | `FUSIONKV_OFFLOAD_AFTER_SECS` | 0 | age before lazy stage |
+| `store_scan_step` | `FUSIONKV_STORE_SCAN_STEP` | 1024 | GPU scan step (eager) |
+| — | `FUSIONKV_VA_BYTES` | 0 (=off) | **elastic**: VA reservation |
+| — | `FUSIONKV_PHYS_INIT_BYTES` | 0 | elastic physical at boot (keep >= graph-capture footprint, e.g. 2 GiB) |
+| — | `FUSIONKV_KV_BYTES` | 0 | elastic advertised KV budget (> physical!) |
+
+Byte values accept `K/M/G/T` (binary) and `KiB/MiB/GiB/TiB`.
+
+## Elastic mode
+
+```bash
+export VLLM_PLUGINS=fusionkv
+export FUSIONKV_VA_BYTES=160GiB        # VA for the KV backing
+export FUSIONKV_PHYS_INIT_BYTES=4GiB   # physical at boot (capture headroom)
+export FUSIONKV_KV_BYTES=96GiB         # advertise this KV pool (>> physical)
+vllm serve /path/to/model --gpu-memory-utilization 0.25
+```
+
+Engine sizes `num_blocks` against `FUSIONKV_KV_BYTES`; only ~4 GiB is
+physically resident until sessions push the block-id watermark up.
+Growth is monotone (Strata rule — never unmap mid-decode); an explicit
+operator-side trim exists in the API (`VmmPool.trim_to`) but is not wired
+to an automatic policy in v1. Requires the native core and the FusionKV
+connector enabled (grow-hints travel in connector metadata).
+
+## Architecture
+
+| file | role |
+|---|---|
+| `csrc/vmm.cpp` | VMM pool: VA reserve + 2 MiB chunk map/unmap (Strata `vmm.cpp`) |
+| `csrc/copy_engine.cpp` | run-coalesced H2D/D2H plane copies, event poll |
+| `csrc/pin_arena.cpp` | pinned arena helpers (`cudaHostRegister` path) |
+| `csrc/driver_api.cpp` | `dlopen("libcuda.so.1")` symbol table |
+| `fusionkv/plan.py` | pure-python twin of `runs_of` coalescing (tested) |
+| `fusionkv/block_index.py` | LRU + second chance + pins, prefix-chain aware |
+| `fusionkv/scheduler.py` | hits/loads/stores/deferred-free protocol |
+| `fusionkv/worker.py` | arena, copy thread, elastic grow, plane maps |
+| `fusionkv/connector.py` | KVConnectorBase_V1 glue (registered "FusionKV") |
+| `fusionkv/patch.py` | elastic monkey-patches (allocate/pool watermark/advertise) |
+| `fusionkv/plugin.py` | `vllm.general_plugins` entry |
+
+Scheduler-side block accounting mirrors vLLM's own
+`simple_cpu_offload` manager contract (two-phase frees via
+`request_finished` hold + injected `finished_sending`, worker-count
+aggregated store acks, `need_flush` on preemption), so HMA, chunked
+prefill and async loads interact exactly the way core expects.
+
+## Tests
+
+Three tiers (CPU unit → GPU native smoke → engine e2e), full guide with
+acceptance criteria and troubleshooting:
+[`docs/testing-guide.md`](docs/testing-guide.md).
+
+```bash
+python -m pytest tests -q           # 27 tests, no GPU/torch needed
+python scripts/native_smoke.py      # GPU + torch: VMM pool + copy parity
+./scripts/gpu_e2e.sh /path/to/model tier     # real-engine checks (GPU host)
+./scripts/gpu_e2e.sh /path/to/model both
+```
+
+## Status / limits
+
+* A-tier: unit-tested against the core scheduler contract; run
+  `scripts/gpu_e2e.sh` on a GPU host for the live check.
+* Single full-attention KV group (typical dense/MoE). Multi-group hybrid
+  (SWA/mamba mixed) runs pass-through with a warning.
+* Elastic: experimental; keep `FUSIONKV_PHYS_INIT_BYTES` above the CUDA-graph
+  capture KV footprint (2 GiB default in `patch._make_pool`).
+* Decode-context-parallel: rejected explicitly (not supported).
