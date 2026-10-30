@@ -1,0 +1,2 @@
+[vllm.general_plugins]
+fusionkv = fusionkv.plugin:load
